@@ -4,16 +4,18 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
+using System.Threading;
+using System.Collections.Generic;
+using System.IO;
 
 namespace GDIScreenshot
 {
     public partial class Form1 : Form
     {
 
-        int nImages = 200;
-        int resX = 1024;
-        int resY = 768;
-        int interval = 250; // 8 fps
+        int resX = SystemInformation.PrimaryMonitorSize.Width;
+        int resY = SystemInformation.PrimaryMonitorSize.Height;
+        int interval = 125; // 1/fps
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetDesktopWindow();
@@ -52,54 +54,116 @@ namespace GDIScreenshot
 
         }
 
+        public static string SaveFolder
+        {
+            get
+            {
+                string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "AAAZCast");
+                Directory.CreateDirectory(folder);
+                return folder;
+            }
+        }
+
         private double Now()
         {
             return (DateTime.Now - new DateTime(2000, 1, 1)).TotalMilliseconds;
         }
 
-        private void btnScreencast_Click(object sender, EventArgs e)
+        private bool capturing = false;
+        private bool stopCapture = false;
+
+        private void btnCapture_Click(object sender, EventArgs e)
         {
+            lock (btnCapture)
+            {
+                if (capturing)
+                {
+                    btnCapture.Text = "Start capturing";
+                    stopCapture = true;
+                    return;
+                }
+
+                btnCapture.Text = "Stop capture";
+                capturing = true;
+            }
+
             Stopwatch timer = new Stopwatch();
+            Stopwatch timer2 = new Stopwatch();
 
             Bitmap bmpPrev = null;
-            timer.Start();
+
             double last = Now();
             double betweenFrames = interval;
 
-            for (int i = 1; i <= nImages; i++)
+            timer.Start();
+            ScreencastData screencastData = new ScreencastData();
+            screencastData.Width = resX;
+            screencastData.Height = resY;
+            screencastData.DelayBetweenFrames = interval;
+
+            //for (int i = 1; i <= nImages; i++)
+            int frameNumber = 0;
+            while(true)
             {
+                if (stopCapture)
+                {
+                    stopCapture = false;
+                    capturing = false;
+                    
+                    timer.Stop();
+                    label.Text = timer.Elapsed.Seconds + " s";
+
+                    using (FileStream stream = new FileStream(Path.Combine(SaveFolder, "zcast.xml"), FileMode.Create))
+                    {
+                        screencastData.SerializeTo(stream);
+                    }
+                    return;
+                }
+                frameNumber++;
+
                 IntPtr desktopWindow = NativeMethods.GetDesktopWindow();
+                timer2.Reset();
+                timer2.Start();
                 Bitmap bmp = CaptureRectangle(desktopWindow, new Rectangle(0, 0, resX, resY));
-                Bitmap diff;
-                if (bmpPrev != null)
+                Debug.WriteLine("capture rectangle: " + timer2.ElapsedMilliseconds + "ms");
+                //bmp.Save(@"C:\Users\Nicolas\Documents\test" + i + ".png");
+
+                WaitCallback callBack = new WaitCallback(ComputeDiffJob);
+                ThreadPool.QueueUserWorkItem(callBack, new ComputeDiffWork()
                 {
-                    diff = ComputeDiff(bmpPrev, bmp);
-                }
-                else
-                {
-                    diff = bmp;
-                }
-                diff.Save(@"C:\Users\Nicolas\Documents\AAA\" + i + ".png");
+                    BmpPrev = bmpPrev,
+                    BmpCur = (Bitmap)bmp.Clone(),
+                    FileName = "zcast" + frameNumber.ToString(),
+                    ScreencastData = screencastData,
+                    FrameNumber = frameNumber - 1,
+                    EncodingQuality = (int)udQuality.Value
+                });
+
                 bmpPrev = bmp;
-                label.Text = "" + i;
+                label.Text = "" + frameNumber;
                 Application.DoEvents();
 
 
                 double now = Now();
-                double remaining = last + betweenFrames - now;
-                last = now;
+                double nextFrameTime = last + betweenFrames;
+                double remaining = nextFrameTime - now;
                 if (remaining > 0)
                 {
-                    //txtLog.AppendText("frame " + i + ": sleeping " + (remaining) + "ms\n");
-                    System.Threading.Thread.Sleep((int)remaining);
+                    txtLog.AppendText("frame " + frameNumber + ": sleeping " + (remaining) + "ms\n");
+                    while ((int)remaining > 1)
+                    {
+                        //txtLog.AppendText(Thread.CurrentThread.ManagedThreadId.ToString());
+                        System.Threading.Thread.Sleep((int)remaining);
+                        now = Now();
+                        remaining = nextFrameTime - now;
+                    }
                 }
                 else
                 {
-                    txtLog.AppendText(String.Format("Missed frame {0} by {1:f2}ms\n", i, -remaining));
+                    txtLog.AppendText(String.Format("Missed frame {0} by {1:f2}ms\n", frameNumber, -remaining));
                 }
+                last = now;
             }
-            timer.Stop();
-            label.Text = timer.ElapsedMilliseconds + " ms";
 
             /*form.WindowState = FormWindowState.Maximized;
             form.FormBorderStyle = FormBorderStyle.None;
@@ -118,7 +182,151 @@ namespace GDIScreenshot
             }*/
         }
 
-        public static Bitmap ComputeDiff(Bitmap bmpPrev, Bitmap bmpCur)
+        private class ComputeDiffWork
+        {
+            public Bitmap BmpPrev { get; set; }
+            public Bitmap BmpCur { get; set; }
+            public int FrameNumber { get; set; }
+            public string FileName { get; set; }
+            public ScreencastData ScreencastData { get; set; }
+            public int EncodingQuality { get; set; }
+        }
+
+        static void ComputeDiffJob(object state)
+        {
+            ComputeDiffWork work = (ComputeDiffWork)state;
+            Debug.WriteLine("ComputeDiff: " + Thread.CurrentThread.ToString());
+            Stopwatch timer = new Stopwatch();
+
+            Bitmap diff;
+            Point offset;
+            bool keyFrame;
+            if (work.BmpPrev != null)
+            {
+                timer.Start();
+                diff = ComputeDiff(work.BmpPrev, work.BmpCur, out offset, out keyFrame);
+                Debug.WriteLine("compute diff: " + timer.ElapsedMilliseconds + "ms");
+            }
+            else
+            {
+                diff = work.BmpCur;
+                keyFrame = true;
+                offset = Point.Empty;
+            }
+
+            timer.Reset();
+            timer.Start();
+
+            string filename;
+
+            if (keyFrame)
+            {
+                filename = work.FileName + ".jpeg";
+                EncoderParameters parameters = new EncoderParameters(1);
+                parameters.Param[0] = new System.Drawing.Imaging.EncoderParameter(Encoder.Quality, work.EncodingQuality);
+                ImageCodecInfo[] ies = ImageCodecInfo.GetImageEncoders();
+                diff.Save(Path.Combine(SaveFolder, filename), ies[1], parameters);
+            }
+            else
+            {
+                filename = work.FileName + ".png";
+                diff.Save(Path.Combine(SaveFolder, filename));
+            }
+
+            lock (work.ScreencastData)
+            {
+                FrameInfo frameInfo = new FrameInfo() { FrameNumber = work.FrameNumber, Offset = offset, FileName = filename };
+                work.ScreencastData.FrameInfos.Add(frameInfo);
+            }
+
+            if (diff != work.BmpCur)
+                diff.Dispose();
+            //Debug.WriteLine("save diff: " + timer.ElapsedMilliseconds + "ms");
+
+            if (work.BmpPrev != null)
+            {
+                work.BmpPrev.Dispose();
+            }
+
+        }
+
+
+        public static Bitmap ComputeDiff(Bitmap bmpPrev, Bitmap bmpCur, out Point offset, out bool keyFrame)
+        {
+            int width = bmpPrev.Size.Width;
+            int height = bmpPrev.Size.Height;
+
+            int minx = width;
+            int miny = height;
+            int maxx = 0;
+            int maxy = 0;
+
+            Bitmap resultImage = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+            Rectangle rect = new Rectangle(new Point(0, 0), bmpPrev.Size);
+
+            // Access the image data directly for faster image processing
+            BitmapData prevImageData = bmpPrev.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            BitmapData curImageData = bmpCur.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            BitmapData resultImageData = resultImage.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+
+            uint nDifferentPixels = 0;
+
+            int length = (prevImageData.Stride * prevImageData.Height) / 4;
+
+            unsafe
+            {
+
+                uint* pPrev = (uint*)prevImageData.Scan0.ToPointer();
+                uint* pCur = (uint*)curImageData.Scan0.ToPointer();
+                uint* pResult = (uint*)resultImageData.Scan0.ToPointer();
+
+                for (int y = 0; y < height; y++)
+                {
+                    for (int x = 0; x < width; x++)
+                    {
+                        if (*pPrev == *pCur)
+                        {
+                            *pResult = 0;
+                        }
+                        else
+                        {
+                            *pResult = *pCur;
+                            nDifferentPixels++;
+                            minx = Math.Min(minx, x);
+                            maxx = Math.Max(maxx, x);
+                            miny = Math.Min(miny, y);
+                            maxy = Math.Max(maxy, y);
+                        }
+
+                        pPrev++;
+                        pCur++;
+                        pResult++;
+                    }
+                }
+            }
+
+            bmpPrev.UnlockBits(prevImageData);
+            bmpCur.UnlockBits(curImageData);
+            resultImage.UnlockBits(resultImageData);
+
+            int croppedWidth = Math.Max(maxx - minx + 1, 1);
+            int croppedHeight = Math.Max(maxy - miny + 1, 1);
+
+            Bitmap resultImageCropped = new Bitmap(croppedWidth, croppedHeight, PixelFormat.Format32bppArgb);
+            Graphics g = Graphics.FromImage(resultImageCropped);
+            //g.Clear(Color.Transparent);
+            keyFrame = nDifferentPixels > width * height / 10;
+            Image usedImg = keyFrame ? bmpCur : resultImage;
+            g.DrawImage(usedImg, 0, 0, new Rectangle(minx, miny, croppedWidth, croppedHeight), GraphicsUnit.Pixel);
+
+            resultImage.Dispose();
+
+            offset = new Point(minx, miny);
+            return resultImageCropped;
+        }
+
+
+        public static Bitmap ComputeDiff2(Bitmap bmpPrev, Bitmap bmpCur)
         {
             int width = bmpPrev.Size.Width;
             int height = bmpPrev.Size.Height;
@@ -196,7 +404,7 @@ namespace GDIScreenshot
 
         private void btnPlay_Click(object sender, EventArgs e)
         {
-            PlayForm form = new PlayForm(resX, resY, nImages, interval);
+            PlayForm form = new PlayForm();
             form.Show();
         }
     }

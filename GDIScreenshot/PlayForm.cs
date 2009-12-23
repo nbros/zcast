@@ -7,42 +7,45 @@ using System.Linq;
 using System.Text;
 using System.Windows.Forms;
 using System.Drawing.Imaging;
+using System.IO;
+using System.Diagnostics;
 
 namespace GDIScreenshot
 {
     public partial class PlayForm : Form
     {
-        private int resX, resY, nFrames, interval;
+        //private int resX, resY, nFrames, interval;
 
-        public PlayForm(int resX, int resY, int nFrames, int interval)
+        public PlayForm()
         {
             InitializeComponent();
-            this.resX = resX;
-            this.resY = resY;
-            this.nFrames = nFrames;
-            this.interval = interval;
         }
 
         int currentFrame = 1;
 
         Bitmap reconstructed;
         Graphics g;
+        ScreencastData screencastData;
 
         private void PlayForm_Load(object sender, EventArgs e)
         {
-            WindowState = FormWindowState.Maximized;
+            screencastData = ScreencastData.DeSerializeFrom(new FileStream(Path.Combine(Form1.SaveFolder, "zcast.xml"), FileMode.Open));
+            screencastData.FrameInfos.Sort((x, y) => x.FrameNumber - y.FrameNumber);
+
             FormBorderStyle = FormBorderStyle.None;
-            TopMost = true;
+            WindowState = FormWindowState.Maximized;
+            //TopMost = true;
 
             Paint += new PaintEventHandler(PlayForm_Paint);
 
             Timer timer = new Timer();
-            timer.Interval = interval;
+            timer.Interval = screencastData.DelayBetweenFrames;
             timer.Tick += new EventHandler(timer_Tick);
             timer.Start();
 
-            reconstructed = new Bitmap(resX, resY, PixelFormat.Format32bppArgb);
+            reconstructed = new Bitmap(screencastData.Width, screencastData.Height, PixelFormat.Format32bppArgb);
             g = Graphics.FromImage(reconstructed);
+
         }
 
         void timer_Tick(object sender, EventArgs e)
@@ -52,12 +55,15 @@ namespace GDIScreenshot
 
         void PlayForm_Paint(object sender, PaintEventArgs e)
         {
-            if (currentFrame > nFrames)
+            if (currentFrame > screencastData.FrameInfos.Count)
                 currentFrame = 1;
 
-            Bitmap bmp = new Bitmap(@"C:\Users\Nicolas\Documents\AAA\" + currentFrame + ".png");
-            g.DrawImage(bmp, 0, 0, new Rectangle(0, 0, resX, resY), GraphicsUnit.Pixel);
-            e.Graphics.DrawImage(reconstructed, 0, 0);
+            FrameInfo frame = screencastData.FrameInfos.ElementAt(currentFrame - 1);
+            Bitmap bmp = new Bitmap(Path.Combine(Form1.SaveFolder, frame.FileName));
+            Point offset = frame.Offset;
+            g.DrawImage(bmp, offset.X, offset.Y); //, new Rectangle(0, 0, resX, resY), GraphicsUnit.Pixel);
+            e.Graphics.DrawImage(reconstructed, Point.Empty);
+            bmp.Dispose();
             currentFrame++;
         }
     }
